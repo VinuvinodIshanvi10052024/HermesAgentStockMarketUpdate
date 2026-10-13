@@ -6,6 +6,12 @@ Uses ltpData for price and getCandleData for volume and RSI calculation.
 RSI signal generation is optional and off by default.
 Robust version designed to handle "Service temporarily overloaded" and rate limit errors
 by skipping bad data, preserving good history, and avoiding false alerts.
+Now includes Yahoo Finance fallback for data retrieval when Angel One is limited.
+Enhanced with TradingAgents-inspired features:
+- Multi-indicator confirmation (volume spike + RSI + MACD)
+- ATR-based dynamic thresholds (volatility-adjusted sensitivity)
+- News sentiment filtering (placeholder for future implementation)
+- Position sizing suggestions in alerts (risk management guidance)
 """
 
 import os
@@ -13,11 +19,19 @@ import sys
 import json
 import time
 import statistics
+import random  # Moved import to top to fix scope issue
 from datetime import datetime, timedelta
 from SmartApi import SmartConnect
 import pyotp
 import subprocess
-import random
+
+# Try to import yfinance for fallback data
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+    print("Warning: yfinance not installed. Yahoo Finance fallback will not be available.", file=sys.stderr)
 
 def _get_hermes_config(key):
     """Get configuration value from Hermes config"""
@@ -37,17 +51,17 @@ def initialize_environment():
         val = _get_hermes_config("angelone.api_key")
         if val:
             os.environ["ANGEL_ONE_API_KEY"] = val
-            
+           
     if not os.getenv("ANGEL_ONE_CLIENT_ID"):
         val = _get_hermes_config("angelone.client_id")
         if val:
             os.environ["ANGEL_ONE_CLIENT_ID"] = val
-            
+           
     if not os.getenv("ANGEL_ONE_PASSWORD"):
         val = _get_hermes_config("angelone.password")
         if val:
             os.environ["ANGEL_ONE_PASSWORD"] = val
-            
+           
     if not os.getenv("ANGEL_ONE_TOTP_SECRET"):
         val = _get_hermes_config("angelone.totp_secret")
         if val:
@@ -123,7 +137,7 @@ SYMBOL_TOKEN_MAP = {
 }
 
 # Volume spike detection parameters
-VOLUME_SPIKE_THRESHOLD = 2.0  # Alert when current volume is 2x average
+VOLUME_SPIKE_THRESHOLD = 2.0  # Base threshold when ATR not available
 VOLUME_HISTORY_DAYS = 5       # Number of days to calculate average volume
 MIN_VOLUME_FOR_ALERT = 10000  # Minimum volume to consider for alert (filters out low-volume stocks)
 
@@ -133,6 +147,26 @@ RSI_LENGTH = 14               # RSI period (typically 14)
 RSI_OVERBOUGHT = 70           # RSI above this = potential SELL signal
 RSI_OVERSOLD = 30             # RSI below this = potential BUY signal
 RSI_HISTORY_DAYS = 5          # Number of days to use for RSI calculation (same as volume history)
+
+# MACD parameters for multi-indicator confirmation
+ENABLE_MACD_CONFIRMATION = True  # Set to True to require MACD confirmation for alerts
+MACD_FAST = 12                  # Fast EMA period
+MACD_SLOW = 26                  # Slow EMA period
+MACD_SIGNAL = 9                 # Signal line EMA period
+
+# ATR parameters for dynamic thresholds
+ENABLE_ATR_DYNAMIC_THRESHOLD = True  # Set to True to enable ATR-based dynamic thresholds
+ATR_LENGTH = 14                 # ATR period (typically 14)
+VOLATILITY_THRESHOLD_MULTIPLIER = 1.5  # Multiply base threshold by (1 + ATR*multiplier/price)
+
+# News sentiment filtering (placeholder - would require news API integration)
+ENABLE_NEWS_SENTIMENT_FILTER = False  # Set to True when news API is available
+NEWS_SENTIMENT_THRESHOLD = 0.1      # Minimum sentiment score to consider news positive/negative
+
+# Position sizing parameters (risk management)
+ENABLE_POSITION_SIZING = True   # Set to True to include position sizing in alerts
+RISK_PER_TRADE = 0.02           # Risk 2% of capital per trade
+STOP_LOSS_ATR_MULTIPLIER = 2.0  # Stop loss = ATR * multiplier
 
 # ROBUST Rate limiting parameters for overloaded service
 MIN_DELAY_BETWEEN_STOCKS = 5.0  # Reasonable delay between each stock (seconds)
@@ -163,14 +197,134 @@ def resolve_symbol_token(symbol):
     print(f"Warning: Symbol {symbol} not in pre-resolved token map", file=sys.stderr)
     return None
 
+def get_ltp_yahoo_finance(symbol):
+    """
+    Get Last Traded Price from Yahoo Finance as fallback
+    Returns price as float or None if failed
+    """
+    if not YFINANCE_AVAILABLE:
+        return None
+        
+    try:
+        # Format symbol for Yahoo Finance (NSE)
+        yahoo_symbol = f"{symbol}.NS"
+        ticker = yf.Ticker(yahoo_symbol)
+        
+        # Get current day's data
+        hist = ticker.history(period="1d", interval="1m")
+        if not hist.empty:
+            # Get the latest price
+            latest_price = hist['Close'].iloc[-1]
+            return float(latest_price)
+        else:
+            # Fallback to info
+            info = ticker.info
+            if 'regularMarketPrice' in info and info['regularMarketPrice'] is not None:
+                return float(info['regularMarketPrice'])
+            elif 'previousClose' in info and info['previousClose'] is not None:
+                return float(info['previousClose'])
+    except Exception as e:
+        print(f"Yahoo Finance LTP error for {symbol}: {e}", file=sys.stderr)
+    
+    return None
+
+def get_candle_data_yahoo_finance(symbol):
+    """
+    Get candle data from Yahoo Finance as fallback
+    Returns (volumes, closes, success_flag) where success_flag indicates if data is reliable
+    """
+    if not YFINANCE_AVAILABLE:
+        return None, None, False
+        
+    try:
+        # Format symbol for Yahoo Finance (NSE)
+        yahoo_symbol = f"{symbol}.NS"
+        ticker = yf.Ticker(yahoo_symbol)
+        
+        # Get today's intraday data (1-minute intervals)
+        hist = ticker.history(period="1d", interval="1m")
+        
+        if hist.empty:
+            return None, None, False
+            
+        # Extract volumes and closing prices
+        volumes = hist['Volume'].tolist()
+        closes = hist['Close'].tolist()
+        
+        # Convert to appropriate types
+        volumes = [int(v) for v in volumes if not (v is None or v != v)]  # Filter out NaN
+        closes = [float(c) for c in closes if not (c is None or c != c)]  # Filter out NaN
+        
+        # Validate data
+        if volumes and closes and sum(volumes) > 0 and max(volumes) > 1000:
+            return volumes, closes, True
+        else:
+            print(f"Warning: Suspicious volume data from Yahoo Finance for {symbol}", file=sys.stderr)
+            return None, None, False
+            
+    except Exception as e:
+        print(f"Yahoo Finance candle data error for {symbol}: {e}", file=sys.stderr)
+        return None, None, False
+
+def get_technical_indicators_yahoo_finance(symbol):
+    """
+    Get technical indicators (RSI, MACD, ATR) from Yahoo Finance as fallback
+    Returns (rsi, macd_hist, atr, success_flag) where success_flag indicates if data is reliable
+    """
+    if not YFINANCE_AVAILABLE:
+        return None, None, None, False
+        
+    try:
+        # Format symbol for Yahoo Finance (NSE)
+        yahoo_symbol = f"{symbol}.NS"
+        ticker = yf.Ticker(yahoo_symbol)
+        
+        # Get historical data for indicator calculation (need enough periods)
+        hist = ticker.history(period="60d")  # Get 60 days to ensure we have enough data
+        
+        if hist.empty or len(hist) < max(RSI_LENGTH, MACD_SLOW, ATR_LENGTH) + 10:
+            return None, None, None, False
+            
+        # Extract price data
+        closes = hist['Close'].tolist()
+        highs = hist['High'].tolist()
+        lows = hist['Low'].tolist()
+        volumes = hist['Volume'].tolist()
+        
+        # Calculate RSI
+        rsi = calculate_rsi(closes, RSI_LENGTH)
+        
+        # Calculate MACD
+        macd_line, macd_signal, macd_hist = calculate_macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+        
+        # Calculate ATR
+        atr = calculate_atr(highs, lows, closes, ATR_LENGTH)
+        
+        # Validate that we got reasonable values
+        if rsi is not None and macd_hist is not None and atr is not None and atr > 0:
+            return rsi, macd_hist, atr, True
+        else:
+            return None, None, None, False
+            
+    except Exception as e:
+        print(f"Yahoo Finance technical indicators error for {symbol}: {e}", file=sys.stderr)
+        return None, None, None, False
+
 def get_ltp(symbol):
-    """Get LTP for a symbol using direct SmartApi call (price only)."""
+    """Get LTP for a symbol using direct SmartApi call (price only) with Yahoo Finance fallback."""
+    # Try Angel One first
     try:
         client = _get_client()
         symbol_token = resolve_symbol_token(symbol)
         
         if not symbol_token:
             print(f"Warning: No token available for {symbol}", file=sys.stderr)
+            # Fall back to Yahoo Finance for price
+            if YFINANCE_AVAILABLE:
+                yahoo_price = get_ltp_yahoo_finance(symbol)
+                if yahoo_price is not None:
+                    print(f"  {symbol}: Using Yahoo Finance price fallback: ₹{yahoo_price:.2f}", file=sys.stderr)
+                    return yahoo_price
             return None
             
         # Exchange is NSE for all our stocks
@@ -184,6 +338,12 @@ def get_ltp(symbol):
             error_msg = ltp_response.get("message", "")
             if "Symbol token not found" in error_msg or "scrip master cache" in error_msg:
                 print(f"Symbol token issue for {symbol}: {error_msg}", file=sys.stderr)
+            # Fall back to Yahoo Finance for price
+            if YFINANCE_AVAILABLE:
+                yahoo_price = get_ltp_yahoo_finance(symbol)
+                if yahoo_price is not None:
+                    print(f"  {symbol}: Using Yahoo Finance price fallback due to API error: ₹{yahoo_price:.2f}", file=sys.stderr)
+                    return yahoo_price
             return None
         
         data = ltp_response.get("data", {})
@@ -191,20 +351,41 @@ def get_ltp(symbol):
         
         if ltp is not None:
             return float(ltp)
-        return None
-        
+        else:
+            # Angel One returned no data, try Yahoo Finance
+            if YFINANCE_AVAILABLE:
+                yahoo_price = get_ltp_yahoo_finance(symbol)
+                if yahoo_price is not None:
+                    print(f"  {symbol}: Using Yahoo Finance price fallback (no data from Angel One): ₹{yahoo_price:.2f}", file=sys.stderr)
+                    return yahoo_price
+            return None
+            
     except Exception as e:
-        print(f"Error getting LTP for {symbol}: {e}", file=sys.stderr)
+        print(f"Error getting LTP for {symbol} from Angel One: {e}", file=sys.stderr)
+        # Fall back to Yahoo Finance
+        if YFINANCE_AVAILABLE:
+            yahoo_price = get_ltp_yahoo_finance(symbol)
+            if yahoo_price is not None:
+                print(f"  {symbol}: Using Yahoo Finance price fallback due to exception: ₹{yahoo_price:.2f}", file=sys.stderr)
+                return yahoo_price
         return None
 
 def get_candle_data_robust(symbol):
     """
     Get 1-minute candle data with robust error handling for overloaded service.
+    Tries Angel One first, then Yahoo Finance as fallback.
     Returns (volumes, closes, success_flag) where success_flag indicates if data is reliable.
     """
+    # Try Angel One first
     symbol_token = resolve_symbol_token(symbol)
     if not symbol_token:
         print(f"Warning: Cannot resolve token for {symbol}", file=sys.stderr)
+        # Try Yahoo Finance as fallback
+        if YFINANCE_AVAILABLE:
+            volumes, closes, success = get_candle_data_yahoo_finance(symbol)
+            if success:
+                print(f"  {symbol}: Using Yahoo Finance data fallback", file=sys.stderr)
+                return volumes, closes, True
         return None, None, False
     
     exchange = "NSE"
@@ -223,7 +404,7 @@ def get_candle_data_robust(symbol):
         "todate": to_time
     }
     
-    # Try with robust error handling
+    # Try Angel One with robust error handling
     for attempt in range(MAX_RETRIES_PER_STOCK + 1):  # +1 for initial attempt
         try:
             # Add jittered delay before each attempt to avoid thundering herd
@@ -246,7 +427,7 @@ def get_candle_data_robust(symbol):
                         if len(candle) >= 6:
                             volumes.append(int(candle[5]))   # Volume is index 5
                             closes.append(float(candle[4]))  # Close is index 4
-                    
+                   
                     if volumes and closes:
                         # Validate that we got reasonable data
                         # Check if volumes are not all zero or extremely low
@@ -275,9 +456,24 @@ def get_candle_data_robust(symbol):
                         continue
                     else:
                         print(f"Max retries exceeded for {symbol} due to service issues", file=sys.stderr)
+                        # Try Yahoo Finance as fallback after exhausting Angel One retries
+                        if YFINANCE_AVAILABLE:
+                            print(f"  {symbol}: Trying Yahoo Finance fallback after Angel One retries exhausted", file=sys.stderr)
+                            yahoo_volumes, yahoo_closes, yahoo_success = get_candle_data_yahoo_finance(symbol)
+                            if yahoo_success:
+                                print(f"  {symbol}: Successfully retrieved data from Yahoo Finance fallback", file=sys.stderr)
+                                return yahoo_volumes, yahoo_closes, True
+                        return None, None, False
                 else:
                     # Non-retryable error (auth, symbol not found, etc.)
                     print(f"Non-retryable error for {symbol}: {error_msg}", file=sys.stderr)
+                    # Try Yahoo Finance as fallback for non-retryable errors too
+                    if YFINANCE_AVAILABLE:
+                        print(f"  {symbol}: Trying Yahoo Finance fallback due to non-retryable Angel One error", file=sys.stderr)
+                        yahoo_volumes, yahoo_closes, yahoo_success = get_candle_data_yahoo_finance(symbol)
+                        if yahoo_success:
+                            print(f"  {symbol}: Successfully retrieved data from Yahoo Finance fallback", file=sys.stderr)
+                            return yahoo_volumes, yahoo_closes, True
                     break
                     
         except Exception as e:
@@ -289,8 +485,15 @@ def get_candle_data_robust(symbol):
                 continue
             break
     
-    # All attempts failed or we got bad data
-    print(f"Failed to get reliable candle data for {symbol} after {MAX_RETRIES_PER_STOCK + 1} attempts", file=sys.stderr)
+    # All Angel One attempts failed or we got bad data, try Yahoo Finance as final fallback
+    if YFINANCE_AVAILABLE:
+        print(f"  {symbol}: All Angel One attempts failed, trying Yahoo Finance fallback", file=sys.stderr)
+        yahoo_volumes, yahoo_closes, yahoo_success = get_candle_data_yahoo_finance(symbol)
+        if yahoo_success:
+            print(f"  {symbol}: Successfully retrieved data from Yahoo Finance fallback", file=sys.stderr)
+            return yahoo_volumes, yahoo_closes, True
+    
+    print(f"Failed to get reliable candle data for {symbol} after all attempts (Angel One + Yahoo Finance fallback)", file=sys.stderr)
     return None, None, False
 
 def get_candle_data(symbol):
@@ -299,6 +502,36 @@ def get_candle_data(symbol):
     """
     volumes, closes, success = get_candle_data_robust(symbol)
     return volumes, closes
+
+def get_technical_indicators(symbol):
+    """
+    Get technical indicators (RSI, MACD, ATR) using SmartApi when possible, 
+    with Yahoo Finance fallback.
+    Returns (rsi, macd_hist, atr, success_flag)
+    """
+    # Try to get from SmartApi candle data first (more reliable for intraday)
+    volumes, closes, success = get_candle_data_robust(symbol)
+    
+    if success and closes and len(closes) >= max(RSI_LENGTH, MACD_SLOW, ATR_LENGTH) + 10:
+        # Calculate indicators from our candle data
+        rsi = calculate_rsi(closes, RSI_LENGTH)
+        _, _, macd_hist = calculate_macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+        # We need high/low for ATR, so extract from candle data if available
+        # For now, we'll use Yahoo Finance for ATR if we don't have high/low
+        atr = None
+        if YFINANCE_AVAILABLE:
+            _, _, atr, _ = get_technical_indicators_yahoo_finance(symbol)
+        
+        if rsi is not None and macd_hist is not None and atr is not None and atr > 0:
+            return rsi, macd_hist, atr, True
+    
+    # Fall back to Yahoo Finance for all indicators
+    if YFINANCE_AVAILABLE:
+        rsi, macd_hist, atr, success = get_technical_indicators_yahoo_finance(symbol)
+        if success:
+            return rsi, macd_hist, atr, True
+    
+    return None, None, None, False
 
 def calculate_rsi(prices, length=RSI_LENGTH):
     """Calculate RSI from a list of closing prices."""
@@ -337,6 +570,80 @@ def calculate_rsi(prices, length=RSI_LENGTH):
             rsi = 100 - (100 / (1 + rs))
     
     return rsi
+
+def calculate_macd(prices, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
+    """Calculate MACD line, signal line, and histogram."""
+    if len(prices) < slow + signal:  # Need enough data for slow EMA and signal EMA
+        return None, None, None
+    
+    # Calculate EMAs
+    ema_fast = calculate_ema(prices, fast)
+    ema_slow = calculate_ema(prices, slow)
+    
+    if ema_fast is None or ema_slow is None:
+        return None, None, None
+    
+    # MACD line = fast EMA - slow EMA
+    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
+    
+    # Signal line = EMA of MACD line
+    macd_signal = calculate_ema(macd_line, signal)
+    
+    if macd_signal is None:
+        return None, None, None
+    
+    # MACD histogram = MACD line - signal line
+    macd_hist = [m - s for m, s in zip(macd_line, macd_signal)]
+    
+    # Return latest values
+    return macd_line[-1], macd_signal[-1], macd_hist[-1]
+
+def calculate_ema(prices, period):
+    """Calculate Exponential Moving Average."""
+    if len(prices) < period:
+        return None
+    
+    # Calculate multiplier
+    multiplier = 2 / (period + 1)
+    
+    # Calculate SMA for first EMA value
+    sma = sum(prices[:period]) / period
+    ema = [sma]
+    
+    # Calculate EMA for remaining values
+    for price in prices[period:]:
+        ema.append((price - ema[-1]) * multiplier + ema[-1])
+    
+    return ema
+
+def calculate_atr(highs, lows, closes, length=ATR_LENGTH):
+    """Calculate Average True Range."""
+    if len(highs) < length + 1 or len(lows) < length + 1 or len(closes) < length + 1:
+        return None
+    
+    # Calculate true ranges
+    tr_list = []
+    for i in range(1, len(highs)):
+        high_low = highs[i] - lows[i]
+        high_close_prev = abs(highs[i] - closes[i-1])
+        low_close_prev = abs(lows[i] - closes[i-1])
+        tr = max(high_low, high_close_prev, low_close_prev)
+        tr_list.append(tr)
+    
+    # Calculate ATR as average of true ranges
+    if len(tr_list) < length:
+        return None
+    
+    # First ATR is simple average
+    atr = sum(tr_list[:length]) / length
+    
+    # For subsequent values, we could use Wilder's smoothing, but for simplicity
+    # we'll just return the latest ATR as the average of the last 'length' true ranges
+    if len(tr_list) >= length:
+        atr = sum(tr_list[-length:]) / length
+        return atr
+    
+    return atr
 
 def get_historical_volume_avg(symbol, days=VOLUME_HISTORY_DAYS):
     """Calculate average volume over the last N days, only using recent reliable data."""
@@ -491,6 +798,7 @@ def check_volume_spikes():
     successful_fetches = 0
     failed_fetches = 0
     skipped_fetches = 0  # For data we got but chose not to use
+    yahoo_fallback_count = 0  # Track Yahoo Finance fallbacks
     
     # Process stocks in small batches with delays between batches
     batches = [WATCHLIST[i:i + REQUEST_BATCH_SIZE] for i in range(0, len(WATCHLIST), REQUEST_BATCH_SIZE)]
@@ -519,10 +827,22 @@ def check_volume_spikes():
                 # Get current volume and closing prices with robust error handling
                 volumes, closes, success = get_candle_data_robust(symbol)
                 
+                # Track if we used Yahoo Finance fallback
                 if not success or volumes is None or closes is None:
-                    print(f"  {symbol}: Could not fetch reliable candle data (skipping for this cycle)", file=sys.stderr)
+                    # This shouldn't happen with our fallback logic, but just in case
+                    print(f"  {symbol}: Could not fetch reliable candle data from any source (skipping for this cycle)", file=sys.stderr)
                     failed_fetches += 1
                     continue
+                
+                # Check if data likely came from Yahoo Finance (simple heuristic)
+                # Yahoo Finance data tends to be more current and consistent during market hours
+                if YFINANCE_AVAILABLE and len(volumes) > 0:
+                    # If we got good data during market hours and Angel One was known to be limited,
+                    # we might have used Yahoo Finance (this is approximate)
+                    current_hour = datetime.now().hour
+                    if 9 <= current_hour <= 15:  # Market hours
+                        # This is a rough heuristic - in practice we'd want to track the source more precisely
+                        pass
                 
                 if len(volumes) == 0:
                     price_str = f"{current_price:.2f}" if current_price is not None else "N/A"
@@ -550,12 +870,22 @@ def check_volume_spikes():
                 # Update volume history ONLY if we have good data
                 update_volume_history(symbol, current_volume)
                 
-                # Calculate average volume from history
+                # --- TRADINGAGENTS ENHANCEMENTS ---
+                
+                # 1. Get technical indicators for multi-indicator confirmation
+                rsi_value, macd_hist, atr_value, indicators_success = get_technical_indicators(symbol)
+                
+                if not indicators_success:
+                    print(f"  {symbol}: Could not fetch technical indicators (skipping enhancement checks)", file=sys.stderr)
+                    rsi_value, macd_hist, atr_value = None, None, None
+                
+                # 2. Calculate historical average volume
                 avg_volume = get_historical_volume_avg(symbol)
                 
                 if avg_volume is None:
                     print(f"  {symbol}: Not enough reliable history for volume average (need {VOLUME_HISTORY_DAYS} days of good data)", file=sys.stderr)
                     volume_spike_detected = False
+                    volume_ratio = 0
                 else:
                     # Calculate volume ratio
                     volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
@@ -563,37 +893,61 @@ def check_volume_spikes():
                     avg_volume_int = int(avg_volume) if avg_volume is not None else 0
                     print(f"  {symbol}: Volume ratio = {volume_ratio:.2f}x (current: {current_volume:,}, avg: {avg_volume_int:,})", file=sys.stderr)
                     
+                    # --- ENHANCEMENT 1: ATR-based dynamic threshold ---
+                    dynamic_threshold = VOLUME_SPIKE_THRESHOLD  # Base threshold
+                    if ENABLE_ATR_DYNAMIC_THRESHOLD and atr_value is not None and current_price is not None and current_price > 0:
+                        # Calculate volatility-adjusted threshold
+                        # Higher ATR (more volatile) = higher threshold needed for signal
+                        volatility_ratio = (atr_value / current_price) * VOLATILITY_THRESHOLD_MULTIPLIER
+                        dynamic_threshold = VOLUME_SPIKE_THRESHOLD * (1 + volatility_ratio)
+                        print(f"  {symbol}: ATR={atr_value:.2f}, Price=₹{current_price:.2f}, Volatility ratio={volatility_ratio:.3f}, Dynamic threshold={dynamic_threshold:.2f}", file=sys.stderr)
+                    
                     # Check for volume spike - only if we have reliable data
-                    volume_spike_detected = volume_ratio >= VOLUME_SPIKE_THRESHOLD
+                    volume_spike_detected = volume_ratio >= dynamic_threshold
                 
-                # --- RSI Signal Generation (Optional) ---
-                rsi_signal = None
-                rsi_value = None
-                if ENABLE_RSI_SIGNALS and len(closes) >= RSI_LENGTH + 1:
-                    # Calculate RSI using the closing prices we have
-                    rsi_value = calculate_rsi(closes, RSI_LENGTH)
-                    if rsi_value is not None:
-                        # Update RSI history
-                        update_rsi_history(symbol, rsi_value)
-                        
-                        # Check for RSI signals
-                        if rsi_value >= RSI_OVERBOUGHT:
-                            rsi_signal = "SELL"
-                            print(f"  {symbol}: RSI={rsi_value:.2f} (OVERBOUGHT - SELL signal)", file=sys.stderr)
-                        elif rsi_value <= RSI_OVERSOLD:
-                            rsi_signal = "BUY"
-                            print(f"  {symbol}: RSI={rsi_value:.2f} (OVERSOLD - BUY signal)", file=sys.stderr)
-                        else:
-                            print(f"  {symbol}: RSI={rsi_value:.2f} (neutral)", file=sys.stderr)
-                    else:
-                        print(f"  {symbol}: Not enough data for RSI calculation (need {RSI_LENGTH+1} closes)", file=sys.stderr)
-                elif ENABLE_RSI_SIGNALS:
-                    print(f"  {symbol}: Insufficient closing prices for RSI (have {len(closes) if closes else 0}, need {RSI_LENGTH+1})", file=sys.stderr)
+                # --- ENHANCEMENT 2: Multi-indicator confirmation ---
+                rsi_confirmation = False
+                macd_confirmation = False
+                
+                if ENABLE_RSI_SIGNALS and rsi_value is not None:
+                    # RSI confirmation: look for extreme RSI values
+                    rsi_confirmation = rsi_value >= RSI_OVERBOUGHT or rsi_value <= RSI_OVERSOLD
+                    print(f"  {symbol}: RSI={rsi_value:.2f}, RSI confirmation={'YES' if rsi_confirmation else 'NO'}", file=sys.stderr)
+                
+                if ENABLE_MACD_CONFIRMATION and macd_hist is not None:
+                    # MACD confirmation: look for histogram changing direction (momentum shift)
+                    # For simplicity, we'll check if histogram is positive (bullish momentum) 
+                    # when we have a volume spike (could be either bullish or bearish)
+                    macd_confirmation = macd_hist > 0  # Positive histogram = bullish momentum
+                    print(f"  {symbol}: MACD hist={macd_hist:.4f}, MACD confirmation={'YES' if macd_confirmation else 'NO'}", file=sys.stderr)
+                
+                # --- ENHANCEMENT 3: News sentiment filtering (placeholder) ---
+                news_sentiment_pass = True  # Default to pass when not implemented
+                if ENABLE_NEWS_SENTIMENT_FILTER:
+                    # TODO: Implement actual news sentiment analysis
+                    # This would require integrating with a news API like NewsAPI, Bloomberg, etc.
+                    # For now, we'll simulate with a random value for demonstration
+                    news_sentiment_score = random.uniform(-1, 1)  # -1 to 1 scale
+                    news_sentiment_pass = abs(news_sentiment_score) >= NEWS_SENTIMENT_THRESHOLD
+                    print(f"  {symbol}: News sentiment score={news_sentiment_score:.2f}, Pass filter={'YES' if news_sentiment_pass else 'NO'}", file=sys.stderr)
+                
+                # --- Determine if alert should be triggered based on all enhancements ---
+                alert_triggered = volume_spike_detected  # Start with volume spike detection
+                
+                # Apply enhancements as AND conditions (all must be true for alert)
+                if ENABLE_RSI_SIGNALS:
+                    alert_triggered = alert_triggered and rsi_confirmation
+                if ENABLE_MACD_CONFIRMATION:
+                    alert_triggered = alert_triggered and macd_confirmation
+                if ENABLE_NEWS_SENTIMENT_FILTER:
+                    alert_triggered = alert_triggered and news_sentiment_pass
+                
+                print(f"  {symbol}: Final alert trigger={'YES' if alert_triggered else 'NO'} (Volume:{volume_spike_detected} RSI:{rsi_confirmation} MACD:{macd_confirmation} News:{news_sentiment_pass})", file=sys.stderr)
                 
                 # --- Generate Alerts ---
                 
-                # 1. Volume Spike Alert - ONLY if we have reliable data
-                if volume_spike_detected:
+                # 1. Volume Spike Alert - ONLY if we have reliable data and all enhancements pass
+                if alert_triggered:
                     # Check if we've alerted recently for volume spike (prevent spam)
                     last_alert_time = volume_alert_state.get(symbol, 0)
                     current_time = time.time()
@@ -601,6 +955,19 @@ def check_volume_spikes():
                     # Only alert if last alert was more than 2 hours ago (volume spikes less frequent)
                     if current_time - last_alert_time > 7200:  # 2 hours
                         spike_percent = ((volume_ratio - 1) * 100) if avg_volume is not None else 0
+                        
+                        # --- ENHANCEMENT 4: Position sizing suggestions ---
+                        position_sizing_text = ""
+                        if ENABLE_POSITION_SIZING and atr_value is not None and current_price is not None and current_price > 0:
+                            # Calculate suggested position size based on ATR and risk management
+                            stop_loss_distance = atr_value * STOP_LOSS_ATR_MULTIPLIER
+                            # Position size = (Risk amount) / (Stop loss distance)
+                            # For simplicity, we'll suggest as percentage of capital
+                            # Assuming we want to risk RISK_PER_TRADE (e.g., 2%) of capital
+                            # Position size % = (RISK_PER_TRADE * current_price) / stop_loss_distance
+                            position_size_pct = (RISK_PER_TRADE * current_price) / stop_loss_distance * 100
+                            position_sizing_text = f"\n💰 *Position Size:* {position_size_pct:.1f}% of capital (Risk: {RISK_PER_TRADE*100:.0f}%, SL: {stop_loss_distance:.2f})"
+                        
                         alert_msg = f"""📊 *VOLUME SPIKE ALERT* – {datetime.now().strftime('%d %b %Y %H:%M IST')}
 
 🏢 *{name} ({symbol})*
@@ -608,6 +975,9 @@ def check_volume_spikes():
 📈 Volume: {current_volume:,} 
 📊 Avg Volume ({VOLUME_HISTORY_DAYS}d): {int(avg_volume) if avg_volume is not None else 0:,}
 🚨 Spike: {volume_ratio:.2f}x ({spike_percent:+.1f}% above average)
+📊 RSI: {rsi_value:.2f}{' (OVERBOUGHT)' if rsi_value is not None and rsi_value >= RSI_OVERBOUGHT else ''}{' (OVERSOLD)' if rsi_value is not None and rsi_value <= RSI_OVERSOLD else ''}
+📈 MACD: {macd_hist:.4f}{' (BULLISH)' if macd_hist is not None and macd_hist > 0 else ''}{' (BEARISH)' if macd_hist is not None and macd_hist < 0 else ''}
+🌡️ ATR: {atr_value:.2f}{' (Volatility: ' + f'{(atr_value/current_price*100):.1f}%' + ')' if atr_value is not None and current_price is not None and current_price > 0 else ''}{position_sizing_text}
 
 _Trade responsibly. This is an automated alert from your Hermes Agent._"""
                         alert_messages.append(alert_msg)
@@ -615,32 +985,18 @@ _Trade responsibly. This is an automated alert from your Hermes Agent._"""
                         print(f"  {symbol}: VOLUME SPIKE ALERT TRIGGERED", file=sys.stderr)
                     else:
                         print(f"  {symbol}: Volume spike alert suppressed (recently alerted)", file=sys.stderr)
-                
-                # 2. RSI Signal Alert (if enabled and signal detected)
-                if ENABLE_RSI_SIGNALS and rsi_signal is not None:
-                    # Check if we've alerted recently for RSI signal (prevent spam)
-                    last_rsi_alert_time = rsi_alert_state.get(symbol, 0)
-                    current_time = time.time()
-                    
-                    # Only alert if last alert was more than 30 minutes ago (RSI signals can be more frequent)
-                    if current_time - last_rsi_alert_time > 1800:  # 30 minutes
-                        rsi_action = "🔴 SELL SIGNAL" if rsi_signal == "SELL" else "🟢 BUY SIGNAL"
-                        rsi_reason = "RSI above 70 (overbought)" if rsi_signal == "SELL" else "RSI below 30 (oversold)"
-                        
-                        alert_msg = f"""📈 *RSI SIGNAL ALERT* – {datetime.now().strftime('%d %b %Y %H:%M IST')}
-
-🏢 *{name} ({symbol})*
-💹 Price: ₹{price_str}
-📊 RSI: {rsi_value:.2f}
-{rsi_action}
-📝 Reason: {rsi_reason}
-
-_Trade responsibly. This is an automated alert from your Hermes Agent._"""
-                        alert_messages.append(alert_msg)
-                        rsi_alert_state[symbol] = current_time
-                        print(f"  {symbol}: RSI {rsi_signal} ALERT TRIGGERED", file=sys.stderr)
-                    else:
-                        print(f"  {symbol}: RSI {rsi_signal} alert suppressed (recently alerted)", file=sys.stderr)
+                # Still show individual enhancement status even if no alert
+                else:
+                    if volume_spike_detected:
+                        reasons = []
+                        if ENABLE_RSI_SIGNALS and not rsi_confirmation:
+                            reasons.append("RSI not extreme")
+                        if ENABLE_MACD_CONFIRMATION and not macd_confirmation:
+                            reasons.append("MACD not confirming")
+                        if ENABLE_NEWS_SENTIMENT_FILTER and not news_sentiment_pass:
+                            reasons.append("News sentiment filter")
+                        if reasons:
+                            print(f"  {symbol}: Volume spike detected but no alert due to: {', '.join(reasons)}", file=sys.stderr)
                 
             except Exception as e:
                 print(f"  {symbol}: Error checking volume/RSI - {e}", file=sys.stderr)
@@ -659,7 +1015,7 @@ _Trade responsibly. This is an automated alert from your Hermes Agent._"""
 def main():
     """Main function to run volume spike detection and optional RSI signals."""
     try:
-        print("Starting Volume Spike Detector (Robust Version for Overloaded Service)...")
+        print("Starting Volume Spike Detector (Robust Version for Overloaded Service with Yahoo Finance Fallback and TradingAgents Enhancements)...")
         alert_messages = check_volume_spikes()
         for msg in alert_messages:
             # Print each alert message to stdout (cron job will capture this)
@@ -669,7 +1025,7 @@ def main():
         return 0
     except Exception as e:
         error_msg = f"""<b>❌ Error in Volume Spike Detector</b> – {datetime.now().strftime('%d %b %Y %H:%M IST')}
-<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>
+<code>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</code>
 
 <b>Technical Details:</b> <code>{str(e)}</code>
 
