@@ -1015,12 +1015,21 @@ _Trade responsibly. This is an automated alert from your Hermes Agent._"""
 def main():
     """Main function to run volume spike detection and optional RSI signals."""
     try:
-        print("Starting Volume Spike Detector (Robust Version for Overloaded Service with Yahoo Finance Fallback and TradingAgents Enhancements)...")
+        # Print startup message to stderr only (does not go to Telegram)
+        print("Starting Volume Spike Detector (Robust Version for Overloaded Service with Yahoo Finance Fallback and TradingAgents Enhancements)...", file=sys.stderr)
         alert_messages = check_volume_spikes()
+        
+        # If no successful data fetches occurred, exit quietly without output to stdout
+        # This prevents sending any message to Telegram when API limits prevent data fetching
+        if successful_fetches == 0:
+            # Exit silently - no output to stdout means no Telegram message
+            return 0
+        
+        # Only produce output if we successfully fetched data for at least one stock
         for msg in alert_messages:
             # Print each alert message to stdout (cron job will capture this)
             print(msg)
-        # If no alerts, print nothing to stdout
+        # If no alerts but we had successful data fetches, still show completion
         print("Volume spike check completed.")
         return 0
     except Exception as e:
